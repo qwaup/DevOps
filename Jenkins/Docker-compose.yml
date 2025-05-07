@@ -1,0 +1,95 @@
+version: '3.8'
+
+services:
+
+  NODE1-init:
+    image: alpine
+    container_name: NODE1-init
+    command: |
+      sh -c 'cat > /init/init.sql <<"EOF"
+      -- Таблица пользователей
+      CREATE TABLE IF NOT EXISTS users (
+          id SERIAL PRIMARY KEY,
+          username VARCHAR(50) NOT NULL UNIQUE,
+          email VARCHAR(100) NOT NULL UNIQUE,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          is_active BOOLEAN DEFAULT TRUE
+      );
+
+      -- Таблица логов
+      CREATE TABLE IF NOT EXISTS logs (
+          id SERIAL PRIMARY KEY,
+          action VARCHAR(50) NOT NULL,
+          description TEXT,
+          user_id INT,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (user_id) REFERENCES users(id)
+      );
+      
+      -- Заполняем таблицу users
+      INSERT INTO users (username, email, is_active) VALUES
+      ('"'"'john_doe'"'"', '"'"'john@example.com'"'"', TRUE),
+      ('"'"'jane_smith'"'"', '"'"'jane@example.com'"'"', TRUE),
+      ('"'"'bob_johnson'"'"', '"'"'bob@example.com'"'"', FALSE),
+      ('"'"'alice_wonder'"'"', '"'"'alice@example.com'"'"', TRUE),
+      ('"'"'mike_tyson'"'"', '"'"'mike@example.com'"'"', TRUE),
+      ('"'"'lisa_simpson'"'"', '"'"'lisa@example.com'"'"', TRUE);
+
+      -- Заполняем таблицу logs
+      INSERT INTO logs (action, description, user_id) VALUES
+      ('"'"'login'"'"', '"'"'User logged in'"'"', 1),
+      ('"'"'purchase'"'"', '"'"'Order #1001 created'"'"', 1),
+      ('"'"'logout'"'"', '"'"'User logged out'"'"', 1),
+      ('"'"'login'"'"', '"'"'User logged in'"'"', 2),
+      ('"'"'product_view'"'"', '"'"'Viewed product #5'"'"', 2),
+      ('"'"'login'"'"', '"'"'User logged in'"'"', 5),
+      ('"'"'profile_update'"'"', '"'"'Updated profile information'"'"', 5),
+      ('"'"'error'"'"', '"'"'Invalid password attempt'"'"', NULL);
+      EOF
+      echo "Init script created"'
+    volumes:
+      - db-initials-scripts:/init
+    restart: on-failure
+
+  NODE1:
+    image: postgres:14.17-bookworm
+    container_name: NODE1
+    restart: unless-stopped
+    ports:
+      - 5432:5432
+    volumes:
+      - db-initials-scripts:/docker-entrypoint-initdb.d
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=pg
+    depends_on:
+      NODE1-init:
+        condition: service_completed_successfully
+
+  NODE2:
+    image: postgres:14.17-bookworm
+    container_name: NODE2
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=pg
+
+  jenkins:
+    build:
+      context: .
+      dockerfile: Dockerfile-jenkins
+    container_name: jenkins
+    ports:
+      - 8080:8080
+    volumes:
+      - ./config.xml:/var/jenkins_home/jobs/TestDevOps/config.xml
+      - backups-pg:/backups
+    environment:
+      - JENKINS_OPTS=-Djenkins.install.runSetupWizard=false
+      - JAVA_OPTS=-Djenkins.install.runSetupWizard=false
+
+volumes:
+  backups-pg:
+  db-initials-scripts:

@@ -1,0 +1,127 @@
+<?xml version='1.1' encoding='UTF-8'?>
+<flow-definition plugin="workflow-job@1520.v56d65e3b_4566">
+  <actions>
+    <org.jenkinsci.plugins.pipeline.modeldefinition.actions.DeclarativeJobAction plugin="pipeline-model-definition@2.2255.v56a_15e805f12"/>
+    <org.jenkinsci.plugins.pipeline.modeldefinition.actions.DeclarativeJobPropertyTrackerAction plugin="pipeline-model-definition@2.2255.v56a_15e805f12">
+      <jobProperties/>
+      <triggers/>
+      <parameters/>
+      <options/>
+    </org.jenkinsci.plugins.pipeline.modeldefinition.actions.DeclarativeJobPropertyTrackerAction>
+  </actions>
+  <description></description>
+  <keepDependencies>false</keepDependencies>
+  <properties/>
+  <definition class="org.jenkinsci.plugins.workflow.cps.CpsFlowDefinition" plugin="workflow-cps@4106.v7a_8a_8176d450">
+    <script>pipeline {
+    agent any
+    
+    environment {
+        // Конфигурация серверов БД
+        NODE1_HOST = &apos;NODE1&apos;
+        NODE2_HOST = &apos;NODE2&apos;
+        DB_PORT = &apos;5432&apos;
+        DB_NAME = &apos;pg&apos;
+        DB_USER = &apos;postgres&apos;
+        // Не используем Jenkins Credentials для воспроизводимости т.к монтирование секретов
+        // при пересоздани контейнера не будет работать должным образом.
+        // Лучше использовать интеграцию с волт и аппроль
+        DB_PASSWORD = &apos;postgres&apos;
+        
+        // Пути для хранения бэкапов
+        BACKUP_DIR = &apos;/backups&apos;
+        MAX_BACKUPS = 5 // Хранить 5 последних версий
+    }
+    stages {
+        stage(&apos;Создание дампа на NODE1&apos;) {
+            steps {
+                script {
+                    // Генерируем имя файла с timestamp
+                    def timestamp = sh(script: &apos;date +%Y%m%d_%H%M%S&apos;, returnStdout: true).trim()
+                    env.BACKUP_FILE = &quot;${DB_NAME}_${timestamp}.dump&quot;
+
+                    // Создаем дамп, исключая таблицу logs
+                    sh &quot;&quot;&quot;
+                        PGPASSWORD=${DB_PASSWORD} pg_dump -h ${NODE1_HOST} -U ${DB_USER} -d ${DB_NAME} \
+                        --exclude-table=logs \
+                        -F c -Z 9 \
+                        -f ${BACKUP_DIR}/${BACKUP_FILE}
+                    &quot;&quot;&quot;
+
+                    // Проверяем что дамп создан
+                    def backupSize = sh(script: &quot;stat -c%s ${BACKUP_DIR}/${BACKUP_FILE}&quot;, returnStdout: true).trim()
+                    if (backupSize == &quot;0&quot;) {
+                        error &quot;Создан пустой дамп! Проверьте параметры подключения к БД.&quot;
+                    }
+                }
+            }
+        }
+
+        stage(&apos;Восстановление на NODE2&apos;) {
+            steps {
+                script {
+                    // Пытаемся восстановить свежий бэкап
+                    try {
+                        sh &quot;&quot;&quot;
+                            PGPASSWORD=${DB_PASSWORD} pg_restore -h ${NODE2_HOST} -U ${DB_USER} -d ${DB_NAME} -F c ${BACKUP_DIR}/${BACKUP_FILE}
+                        &quot;&quot;&quot;
+
+                        // Проверяем успешность восстановления
+                        echo &apos;Проверка успешности восстановления&apos;
+                        def tablesCount = sh(script: &quot;&quot;&quot;
+                            PGPASSWORD=${DB_PASSWORD} psql -h ${NODE2_HOST} -U ${DB_USER} -d ${DB_NAME} -c &quot;SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = &apos;public&apos;&quot;
+                        &quot;&quot;&quot;, returnStdout: true).trim()
+                        
+                        if (tablesCount.contains(&quot;0&quot;)) {
+                            error &quot;Восстановление не удалось - в БД нет таблиц!&quot;
+                        }
+                        
+                        echo &quot;Восстановление успешно завершено&quot;
+                    } catch (Exception e) {
+                        echo &quot;Ошибка при восстановлении свежего бэкапа: ${e.getMessage()}&quot;
+                        
+                        // Ищем предыдущий рабочий бэкап
+                        def lastGoodBackup = sh(script: &quot;&quot;&quot;
+                            ls -t ${BACKUP_DIR}/${DB_NAME}_*.dump | head -n 2 | tail -n 1
+                        &quot;&quot;&quot;, returnStdout: true).trim()
+                        
+                        if (lastGoodBackup) {
+                            echo &quot;Пробуем восстановить предыдущий бэкап: ${lastGoodBackup}&quot;
+                            sh &quot;&quot;&quot;
+                                PGPASSWORD=${DB_PASSWORD} pg_restore -h ${NODE2_HOST} -U ${DB_USER} -d ${DB_NAME} \
+                                -c -F c ${lastGoodBackup}
+                            &quot;&quot;&quot;
+                            // Удаляем битый бэкап
+                            sh &quot;rm -f ${BACKUP_DIR}/${BACKUP_FILE}&quot;
+                            env.BACKUP_FILE = lastGoodBackup.split(&apos;/&apos;)[-1]
+                        } else {
+                            error &quot;Нет рабочего бэкапа для восстановления!&quot;
+                        }
+                    }
+                }
+            }
+        }
+
+        stage(&apos;Очистка старых бэкапов&apos;) {
+            steps {
+                script {
+                    // Оставляем только MAX_BACKUPS последних бэкапов на NODE2
+                    sh &quot;&quot;&quot;
+                        ls -t ${BACKUP_DIR}/${DB_NAME}_*.dump | tail -n +\$((${MAX_BACKUPS}+1)) | xargs rm -f
+                    &quot;&quot;&quot;
+                }
+            }
+        }
+    }
+
+    post {
+        failure {
+            echo &quot;Процесс резервного копирования завершился с ошибкой&quot;
+        }
+    }
+}</script>
+    <sandbox>true</sandbox>
+  </definition>
+  <triggers/>
+  <disabled>false</disabled>
+</flow-definition>

@@ -1,0 +1,107 @@
+pipeline {
+    agent any
+    
+    environment {
+        // Конфигурация серверов БД
+        NODE1_HOST = 'NODE1'
+        NODE2_HOST = 'NODE2'
+        DB_PORT = '5432'
+        DB_NAME = 'pg'
+        DB_USER = 'postgres'
+        // Не используем Jenkins Credentials для воспроизводимости т.к монтирование секретов
+        // при пересоздани контейнера не будет работать должным образом.
+        // Лучше использовать интеграцию с волт и аппроль
+        DB_PASSWORD = 'postgres'
+        
+        // Пути для хранения бэкапов
+        BACKUP_DIR = '/backups'
+        MAX_BACKUPS = 5 // Хранить 5 последних версий
+    }
+    stages {
+        stage('Создание дампа на NODE1') {
+            steps {
+                script {
+                    // Генерируем имя файла с timestamp
+                    def timestamp = sh(script: 'date +%Y%m%d_%H%M%S', returnStdout: true).trim()
+                    env.BACKUP_FILE = "${DB_NAME}_${timestamp}.dump"
+
+                    // Создаем дамп, исключая таблицу logs
+                    sh """
+                        PGPASSWORD=${DB_PASSWORD} pg_dump -h ${NODE1_HOST} -U ${DB_USER} -d ${DB_NAME} \
+                        --exclude-table=logs \
+                        -F c -Z 9 \
+                        -f ${BACKUP_DIR}/${BACKUP_FILE}
+                    """
+
+                    // Проверяем что дамп создан
+                    def backupSize = sh(script: "stat -c%s ${BACKUP_DIR}/${BACKUP_FILE}", returnStdout: true).trim()
+                    if (backupSize == "0") {
+                        error "Создан пустой дамп! Проверьте параметры подключения к БД."
+                    }
+                }
+            }
+        }
+
+        stage('Восстановление на NODE2') {
+            steps {
+                script {
+                    // Пытаемся восстановить свежий бэкап
+                    try {
+                        sh """
+                            PGPASSWORD=${DB_PASSWORD} pg_restore -h ${NODE2_HOST} -U ${DB_USER} -d ${DB_NAME} -F c ${BACKUP_DIR}/${BACKUP_FILE}
+                        """
+
+                        // Проверяем успешность восстановления
+                        echo 'Проверка успешности восстановления'
+                        def tablesCount = sh(script: """
+                            PGPASSWORD=${DB_PASSWORD} psql -h ${NODE2_HOST} -U ${DB_USER} -d ${DB_NAME} -c "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = 'public'"
+                        """, returnStdout: true).trim()
+                        
+                        if (tablesCount.contains("0")) {
+                            error "Восстановление не удалось - в БД нет таблиц!"
+                        }
+                        
+                        echo "Восстановление успешно завершено"
+                    } catch (Exception e) {
+                        echo "Ошибка при восстановлении свежего бэкапа: ${e.getMessage()}"
+                        
+                        // Ищем предыдущий рабочий бэкап
+                        def lastGoodBackup = sh(script: """
+                            ls -t ${BACKUP_DIR}/${DB_NAME}_*.dump | head -n 2 | tail -n 1
+                        """, returnStdout: true).trim()
+                        
+                        if (lastGoodBackup) {
+                            echo "Пробуем восстановить предыдущий бэкап: ${lastGoodBackup}"
+                            sh """
+                                PGPASSWORD=${DB_PASSWORD} pg_restore -h ${NODE2_HOST} -U ${DB_USER} -d ${DB_NAME} \
+                                -c -F c ${lastGoodBackup}
+                            """
+                            // Удаляем битый бэкап
+                            sh "rm -f ${BACKUP_DIR}/${BACKUP_FILE}"
+                            env.BACKUP_FILE = lastGoodBackup.split('/')[-1]
+                        } else {
+                            error "Нет рабочего бэкапа для восстановления!"
+                        }
+                    }
+                }
+            }
+        }
+
+        stage('Очистка старых бэкапов') {
+            steps {
+                script {
+                    // Оставляем только MAX_BACKUPS последних бэкапов на NODE2
+                    sh """
+                        ls -t ${BACKUP_DIR}/${DB_NAME}_*.dump | tail -n +\$((${MAX_BACKUPS}+1)) | xargs rm -f
+                    """
+                }
+            }
+        }
+    }
+
+    post {
+        failure {
+            echo "Процесс резервного копирования завершился с ошибкой"
+        }
+    }
+}
